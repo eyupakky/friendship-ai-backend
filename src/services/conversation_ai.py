@@ -2,12 +2,13 @@
 Konuşma AI Servisi
 
 Kullanıcılarla doğal konuşma yapan ve kişilik analizi için veri toplayan AI.
+Ollama (yerel LLM) kullanır - ücretsiz ve sınırsız.
 """
 
 import uuid
+import httpx
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime
-from openai import AsyncOpenAI
 
 from ..models.personality import (
     PersonalityProfile,
@@ -18,7 +19,7 @@ from .personality_analyzer import PersonalityAnalyzer
 
 
 class ConversationAI:
-    """Kullanıcılarla konuşma yapan AI"""
+    """Kullanıcılarla konuşma yapan AI - Ollama (ücretsiz, yerel)"""
 
     SYSTEM_PROMPT = """Sen samimi, meraklı ve empatik bir arkadaşsın. Amacın kullanıcıyı tanımak ve onunla doğal bir sohbet yapmak.
 
@@ -43,9 +44,10 @@ anlamak. Ama bunu doğrudan sorma, doğal konuşma içinde öğren.
 Kalan minimum mesaj sayısı: {remaining_messages}
 """
 
-    def __init__(self, openai_api_key: str):
-        self.client = AsyncOpenAI(api_key=openai_api_key)
-        self.analyzer = PersonalityAnalyzer(openai_api_key)
+    def __init__(self, ollama_url: str = "http://localhost:11434", model: str = "llama3.2:1b"):
+        self.ollama_url = ollama_url
+        self.model = model
+        self.analyzer = PersonalityAnalyzer(ollama_url, model)
         self.active_sessions: Dict[str, ConversationSession] = {}
         self.user_profiles: Dict[str, PersonalityProfile] = {}
 
@@ -158,58 +160,67 @@ Kalan minimum mesaj sayısı: {remaining_messages}
         session: ConversationSession,
         profile: PersonalityProfile
     ) -> str:
-        """AI cevabı üret"""
+        """AI cevabı üret - Ollama kullanarak"""
 
-        # Konuşma geçmişini hazırla
-        messages = [
-            {
-                "role": "system",
-                "content": self.SYSTEM_PROMPT.format(
-                    phase=session.analysis_phase,
-                    remaining_messages=max(0, 30 - len([m for m in session.messages if not m.is_from_ai]))
-                )
-            }
-        ]
-
-        # Son 20 mesajı ekle
-        for msg in session.messages[-20:]:
-            role = "assistant" if msg.is_from_ai else "user"
-            messages.append({"role": role, "content": msg.content})
-
-        # Analiz tamamlanmak üzereyse özel mesaj ekle
         user_message_count = len([m for m in session.messages if not m.is_from_ai])
-        if user_message_count >= 28 and not session.is_analysis_complete:
-            messages.append({
-                "role": "system",
-                "content": "Konuşma bitiyor. Son birkaç mesajda kullanıcıya teşekkür et ve arkadaşlık eşleştirmesi için hazır olduğunu söyle."
-            })
 
-        # Eğer bu ilk mesajsa, özel başlangıç isteği ekle
+        # Sistem promptunu hazırla
+        system_prompt = self.SYSTEM_PROMPT.format(
+            phase=session.analysis_phase,
+            remaining_messages=max(0, 30 - user_message_count)
+        )
+
+        # Konuşma geçmişini formatla
+        conversation_text = ""
+        for msg in session.messages[-20:]:
+            role = "Asistan" if msg.is_from_ai else "Kullanıcı"
+            conversation_text += f"{role}: {msg.content}\n"
+
+        # Özel durumlar için ek talimatlar
+        extra_instruction = ""
         if len(session.messages) <= 1:
-            messages.append({
-                "role": "system",
-                "content": "Bu konuşmanın başlangıcı. Kendini tanıt ve kullanıcıyla tanışmaya başla. Samimi ama profesyonel ol."
-            })
+            extra_instruction = "\n\nBu konuşmanın başlangıcı. Kendini tanıt ve kullanıcıyla tanışmaya başla. Samimi ama profesyonel ol."
+        elif user_message_count >= 28 and not session.is_analysis_complete:
+            extra_instruction = "\n\nKonuşma bitiyor. Son birkaç mesajda kullanıcıya teşekkür et ve arkadaşlık eşleştirmesi için hazır olduğunu söyle."
+
+        prompt = f"""{system_prompt}{extra_instruction}
+
+Konuşma:
+{conversation_text}
+
+Asistan:"""
 
         try:
-            response = await self.client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=messages,
-                temperature=0.8,
-                max_tokens=300,
-                presence_penalty=0.6,
-                frequency_penalty=0.3
-            )
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                response = await client.post(
+                    f"{self.ollama_url}/api/generate",
+                    json={
+                        "model": self.model,
+                        "prompt": prompt,
+                        "stream": False,
+                        "options": {
+                            "temperature": 0.8,
+                            "num_predict": 300
+                        }
+                    }
+                )
 
-            return response.choices[0].message.content.strip()
+                if response.status_code == 200:
+                    result = response.json()
+                    ai_response = result.get("response", "").strip()
+
+                    # Boş cevap kontrolü
+                    if ai_response:
+                        return ai_response
 
         except Exception as e:
             print(f"AI cevap üretme hatası: {e}")
-            # Fallback cevap
-            return self.analyzer.get_next_question(
-                session.analysis_phase,
-                session.topics_covered
-            )
+
+        # Fallback cevap
+        return self.analyzer.get_next_question(
+            session.analysis_phase,
+            session.topics_covered
+        )
 
     async def get_session_summary(self, user_id: str) -> Dict:
         """Oturum özetini getir"""

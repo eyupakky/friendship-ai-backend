@@ -26,7 +26,10 @@ matching_engine: Optional[MatchingEngine] = None
 def get_conversation_ai() -> ConversationAI:
     global conversation_ai
     if conversation_ai is None:
-        conversation_ai = ConversationAI(settings.OPENAI_API_KEY)
+        conversation_ai = ConversationAI(
+            ollama_url=settings.OLLAMA_URL,
+            model=settings.OLLAMA_MODEL
+        )
     return conversation_ai
 
 

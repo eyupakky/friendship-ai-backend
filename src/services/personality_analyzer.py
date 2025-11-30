@@ -2,15 +2,14 @@
 Kişilik Analizi Servisi
 
 Bu servis, kullanıcı mesajlarını analiz ederek Big Five kişilik özelliklerini tespit eder.
-OpenAI GPT API kullanarak doğal dil işleme yapar.
+Ollama (yerel LLM) kullanarak ücretsiz doğal dil işleme yapar.
 """
 
 import json
 import re
+import httpx
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime
-import openai
-from openai import AsyncOpenAI
 
 from ..models.personality import (
     PersonalityProfile,
@@ -21,7 +20,7 @@ from ..models.personality import (
 
 
 class PersonalityAnalyzer:
-    """Kişilik analizi yapan AI servisi"""
+    """Kişilik analizi yapan AI servisi - Ollama (ücretsiz, yerel)"""
 
     # Kişilik özelliklerini tespit etmek için anahtar kelimeler ve kalıplar
     TRAIT_INDICATORS = {
@@ -111,8 +110,9 @@ class PersonalityAnalyzer:
         ]
     }
 
-    def __init__(self, openai_api_key: str):
-        self.client = AsyncOpenAI(api_key=openai_api_key)
+    def __init__(self, ollama_url: str = "http://localhost:11434", model: str = "llama3.2:1b"):
+        self.ollama_url = ollama_url
+        self.model = model
         self.analysis_cache: Dict[str, Dict] = {}
 
     async def analyze_message(
@@ -131,7 +131,7 @@ class PersonalityAnalyzer:
         keyword_scores = self._analyze_keywords(message)
 
         # Sonra LLM ile derin analiz
-        llm_scores = await self._analyze_with_llm(message, conversation_history)
+        llm_scores = await self._analyze_with_ollama(message, conversation_history)
 
         # İki analizi birleştir (LLM'e daha fazla ağırlık ver)
         combined_scores = {}
@@ -168,12 +168,12 @@ class PersonalityAnalyzer:
 
         return scores
 
-    async def _analyze_with_llm(
+    async def _analyze_with_ollama(
         self,
         message: str,
         conversation_history: List[ConversationMessage]
     ) -> Dict[str, float]:
-        """LLM kullanarak derin kişilik analizi"""
+        """Ollama (yerel LLM) kullanarak derin kişilik analizi"""
 
         # Konuşma geçmişini formatla
         history_text = "\n".join([
@@ -195,40 +195,47 @@ Her özellik için 0.0 ile 1.0 arasında bir skor ver:
 - agreeableness: Uyumluluk, işbirliği, empati (yüksek = çok uyumlu/empatik)
 - neuroticism: Nevrotiklik, duygusal dengesizlik (yüksek = çok endişeli/stresli)
 
-Sadece JSON formatında cevap ver, başka bir şey yazma:
-{{"openness": 0.X, "conscientiousness": 0.X, "extraversion": 0.X, "agreeableness": 0.X, "neuroticism": 0.X}}
+SADECE JSON formatında cevap ver, başka hiçbir şey yazma:
+{{"openness": 0.5, "conscientiousness": 0.5, "extraversion": 0.5, "agreeableness": 0.5, "neuroticism": 0.5}}
 """
 
         try:
-            response = await self.client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "Sen bir kişilik analizi uzmanısın. Kullanıcıların mesajlarından kişilik özelliklerini analiz ediyorsun. Sadece JSON formatında cevap ver."
-                    },
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.3,
-                max_tokens=200
-            )
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                response = await client.post(
+                    f"{self.ollama_url}/api/generate",
+                    json={
+                        "model": self.model,
+                        "prompt": prompt,
+                        "stream": False,
+                        "options": {
+                            "temperature": 0.3,
+                            "num_predict": 200
+                        }
+                    }
+                )
 
-            result_text = response.choices[0].message.content.strip()
-            # JSON'ı parse et
-            scores = json.loads(result_text)
+                if response.status_code == 200:
+                    result = response.json()
+                    result_text = result.get("response", "").strip()
 
-            # Skorları validate et
-            validated_scores = {}
-            for trait in PersonalityTrait:
-                score = scores.get(trait.value, 0.5)
-                validated_scores[trait.value] = min(max(float(score), 0.0), 1.0)
+                    # JSON'ı bul ve parse et
+                    json_match = re.search(r'\{[^}]+\}', result_text)
+                    if json_match:
+                        scores = json.loads(json_match.group())
 
-            return validated_scores
+                        # Skorları validate et
+                        validated_scores = {}
+                        for trait in PersonalityTrait:
+                            score = scores.get(trait.value, 0.5)
+                            validated_scores[trait.value] = min(max(float(score), 0.0), 1.0)
+
+                        return validated_scores
 
         except Exception as e:
-            print(f"LLM analiz hatası: {e}")
-            # Hata durumunda nötr skorlar döndür
-            return {trait.value: 0.5 for trait in PersonalityTrait}
+            print(f"Ollama analiz hatası: {e}")
+
+        # Hata durumunda nötr skorlar döndür
+        return {trait.value: 0.5 for trait in PersonalityTrait}
 
     async def update_personality_profile(
         self,
@@ -276,30 +283,39 @@ Sadece JSON formatında cevap ver, başka bir şey yazma:
 
 {user_messages}
 
-En fazla 10 ilgi alanı listele. Sadece JSON array formatında cevap ver:
-["ilgi1", "ilgi2", ...]
+En fazla 10 ilgi alanı listele. SADECE JSON array formatında cevap ver, başka bir şey yazma:
+["ilgi1", "ilgi2"]
 """
 
         try:
-            response = await self.client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "Kullanıcı mesajlarından ilgi alanlarını tespit et. Sadece JSON array döndür."
-                    },
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.3,
-                max_tokens=200
-            )
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                response = await client.post(
+                    f"{self.ollama_url}/api/generate",
+                    json={
+                        "model": self.model,
+                        "prompt": prompt,
+                        "stream": False,
+                        "options": {
+                            "temperature": 0.3,
+                            "num_predict": 200
+                        }
+                    }
+                )
 
-            result = json.loads(response.choices[0].message.content.strip())
-            return result if isinstance(result, list) else []
+                if response.status_code == 200:
+                    result = response.json()
+                    result_text = result.get("response", "").strip()
+
+                    # JSON array'i bul
+                    json_match = re.search(r'\[.*?\]', result_text, re.DOTALL)
+                    if json_match:
+                        interests = json.loads(json_match.group())
+                        return interests if isinstance(interests, list) else []
 
         except Exception as e:
             print(f"İlgi alanı tespit hatası: {e}")
-            return []
+
+        return []
 
     async def detect_communication_style(
         self,

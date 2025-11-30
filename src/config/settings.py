@@ -17,8 +17,9 @@ class Settings(BaseSettings):
     # API
     API_PREFIX: str = "/api/v1"
 
-    # OpenAI
-    OPENAI_API_KEY: str
+    # Ollama (Yerel LLM - Ücretsiz)
+    OLLAMA_URL: str = "http://localhost:11434"
+    OLLAMA_MODEL: str = "llama3.2:1b"
 
     # Veritabanı
     DATABASE_URL: str = "postgresql+asyncpg://user:password@localhost:5432/friendship_ai"
